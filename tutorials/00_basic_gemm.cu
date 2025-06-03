@@ -60,6 +60,7 @@
 
 // Helper methods to check for errors
 #include "helper.h"
+#include "cutlass_all_functions.h"
 
 //
 // CUTLASS includes needed for single-precision GEMM kernel

@@ -47,6 +47,7 @@ ext_modules.append(
         sources=[
             "csrc/cutlass_api.cpp",
             "tutorials/00_basic_gemm.cu",
+            "tutorials/01_cutlass_utilities.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args,
@@ -72,6 +73,7 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "cutlass" / "include",
+            Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
             Path(this_dir) / "tutorials",
         ],
     )
