@@ -17,7 +17,8 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", nvcc_threads]
 
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+# We use a specific version of cutlass for flash attn
+#subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 cc_flag = []
 cc_flag.append("-gencode")
@@ -48,6 +49,9 @@ ext_modules.append(
             "csrc/cutlass_api.cpp",
             "tutorials/00_basic_gemm.cu",
             "tutorials/01_cutlass_utilities.cu",
+            "csrc/flash_api.cpp",
+            "tutorials/flash_attn/flash_fwd_hdim128_bf16_sm90.cu",
+            "tutorials/flash_attn/flash_prepare_scheduler.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args,
@@ -75,6 +79,7 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
             Path(this_dir) / "tutorials",
+            Path(this_dir) / "tutorials" / "flash_attn",
         ],
     )
 )
