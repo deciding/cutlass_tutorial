@@ -49,6 +49,9 @@ ext_modules.append(
             "csrc/cutlass_api.cpp",
             "tutorials/00_basic_gemm.cu",
             "tutorials/01_cutlass_utilities.cu",
+
+            "tutorials/cute/wgmma_sm90.cu",
+
             "csrc/flash_api.cpp",
             "tutorials/flash_attn/flash_fwd_hdim128_bf16_sm90.cu",
             "tutorials/flash_attn/flash_prepare_scheduler.cu",
