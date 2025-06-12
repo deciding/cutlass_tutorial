@@ -119,6 +119,30 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor sA_ = as_position_independent_swizzle_tensor(sA);
   Tensor tAsA = thr_copy_a.partition_D(sA_);                           // (CPY,CPY_M,CPY_K,PIPE)
 
+#if 0
+  if (thread0()){
+      print("thr_copy_a:\n");
+      print(thr_copy_a);
+      print("\n");
+      print("gA:\n");
+      print(gA);
+      print("\n");
+      print("tAgA:\n");
+      print(tAgA);
+      print("\n");
+      print("sA:\n");
+      print(sA);
+      print("\n");
+      print("sA_:\n");
+      print(sA_);
+      print("\n");
+      print("tAsA:\n");
+      print(tAsA);
+      print("\n");
+      print("\n");
+  }
+#endif
+
   ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
   Tensor tBgB = thr_copy_b.partition_S(gB);                            // (CPY,CPY_N,CPY_K,k)
   Tensor sB_ = as_position_independent_swizzle_tensor(sB);
@@ -164,6 +188,42 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
   // Allocate the accumulators -- same size as the projected data
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
+
+#if 0
+  if (thread0()){
+      //Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
+
+      print(thr_mma);
+      print("\n");
+      print(cta_coord);
+      print("\n\n");
+
+      print(sA);
+      print("\n");
+      print(sB);
+      print("\n");
+      print(gC);
+      print("\n");
+      print(cta_tiler);
+      print("\n\n");
+
+      print(tCsA);
+      print("\n");
+      print(tCsB);
+      print("\n");
+      print(tCgC);
+      print("\n\n");
+
+      print(tCrA);
+      print("\n");
+      print(tCrB);
+      print("\n");
+      print(tCrC);
+      print("\n\n");
+      
+      print("\n");
+  }
+#endif
 
   CUTE_STATIC_ASSERT_V((size<1>(tCgC) == size<1>(tCsA)));              // MMA_M
   CUTE_STATIC_ASSERT_V((size<2>(tCgC) == size<1>(tCsB)));              // MMA_N
@@ -262,7 +322,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     //
 
     // Wait on all cp.async -- optimize by pipelining to overlap GMEM reads
-    cp_async_wait<0>();
+    cp_async_wait<K_PIPE_MAX-1>();
 
     warpgroup_fence_operand(tCrC);
     warpgroup_arrive();
@@ -270,7 +330,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     cute::gemm(mma, tCrA(_,_,_,k_pipe_read), tCrB(_,_,_,k_pipe_read), tCrC);
     warpgroup_commit_batch();
     /// Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
-    warpgroup_wait<0>();
+    warpgroup_wait<K_PIPE_MAX-1>();
     warpgroup_fence_operand(tCrC);
 
     // Advance k_pipe_read
@@ -421,7 +481,123 @@ gemm_tn(int m, int n, int k,
                                     Layout<Shape<_16,_8>,Stride<_8,_1>>{}, // Thr layout 16x8 k-major
                                     Layout<Shape< _1,_8>>{});              // Val layout  1x8
 
+#if 0
+  if (thread0()){
+      print(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{});
+      print("\n");
+      print(copyA);
+      print("\n\n");
+
+      auto rs = copyA.retile(Layout<Shape<_16, _128, _128>, Stride<_1, _1024, _8>>{});
+      print(rs);
+      print("\n\n");
+
+      auto ss = copyA.tidfrg_S(Layout<Shape<_128, _128>, Stride<_128, _1>>{});
+
+      auto thr_layout = Layout<Shape<_16,_8>,Stride<_8,_1>>{};
+      auto val_layout = Layout<Shape< _1,_8>>{};
+      auto layout_mn = raked_product(
+                        thr_layout, // Thr layout 16x8 k-major
+                        val_layout  // Val layout  1x8
+      );
+      auto layout_tv = right_inverse(layout_mn).with_shape(make_shape(size(thr_layout), size(val_layout)));
+      print(size(thr_layout));
+      print("\n");
+      print(size(val_layout));
+      print("\n");
+      print(right_inverse(layout_mn));
+      print("\n");
+      print(layout_mn);
+      print("\n");
+      print(layout_tv);
+      print("\n\n");
+
+      print(ss);
+      print("\n\n");
+
+      auto tiler0 = Layout<Shape<_2,Int<5>>, Stride<Int<5>,_1>>{};
+      auto layout0 = Layout<Shape<Int<3>,_4, _2>, Stride<_1,Int<3>, _1>>{};
+      auto lp = logical_product(tiler0, layout0);
+      print(lp);
+      print("\n");
+      auto lp1 = tiled_product(tiler0, layout0);
+      print(lp1);
+      print("\n");
+      auto lp2 = zipped_product(tiler0, layout0);
+      print(lp2);
+      print("\n");
+      auto lp3 = flat_product(tiler0, layout0);
+      print(lp3);
+      print("\n");
+      auto lp4 = blocked_product(tiler0, layout0);
+      print(lp4);
+      print("\n");
+      auto lp5 = raked_product(tiler0, layout0);
+      print(lp5);
+      print("\n\n");
+
+
+
+      auto layout_a = make_layout(make_shape (Int< 9>{}, make_shape (Int< 4>{}, Int<8>{})),
+                                  make_stride(Int<59>{}, make_stride(Int<13>{}, Int<1>{})));
+      auto tiler = make_tile(Layout<_3,_3>{},           // Apply     3:3     to mode-0
+                             Layout<Shape <_2,_4>,      // Apply (2,4):(1,8) to mode-1
+                                    Stride<_1,_8>>{});
+      
+      auto ld = logical_divide(layout_a, tiler);
+      print(ld);
+      print("\n");
+
+      auto ld1 = tiled_divide(layout_a, tiler);
+      print(ld1);
+      print("\n");
+
+      auto ld2 = zipped_divide(layout_a, tiler);
+      print(ld2);
+      print("\n");
+
+      auto ld3 = flat_divide(layout_a, tiler);
+      print(ld3);
+      print("\n\n");
+
+      auto tiler_new = make_tile(tiler0, layout0);
+      auto layout_new = make_layout(tiler0, layout0);
+      print(tiler_new);
+      print("\n");
+      print(layout_new);
+      print("\n");
+
+      print(product_each(shape(layout_new)));
+      print("\n");
+  }
+#endif
+
   TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K,GMMA::Major::K>{});
+
+#if 0
+  if (thread0()){
+      auto mma_atom = MMA_Atom<SM90_64x64x16_F16F16F16_SS<GMMA::Major::K,GMMA::Major::K>>{};
+      print(tiled_mma);
+      print("\n");
+      using TESTLayout = Layout<Shape<_128,_128>, Stride<_128,_1>>;
+      auto lC = TESTLayout{};
+      auto lc = tiled_mma.thrfrg_C(lC);
+      print(lc);
+      print("\n");
+      print("\n");
+
+  }
+#endif
+
+  //if (thread0()){
+  //    print(m);
+  //    print("\n");
+  //    print(n);
+  //    print("\n");
+  //    print(k);
+  //    print("\n");
+  //    print("\n");
+  //}
 
 #if 0
   print(copyA);
@@ -493,6 +669,125 @@ gemm(char transA, char transB, int m, int n, int k,
   assert(false && "Not implemented");
 }
 
+/// Naive reference GEMM computation.
+template <class TA, class TB, class TC,
+          class TI>
+__global__ void ReferenceGemm_kernel(
+  int M,
+  int N,
+  int K,
+  TI alpha,
+  TA const *A,
+  int lda,
+  TB const *B,
+  int ldb,
+  TI beta,
+  TC *C,
+  int ldc) {
+
+  int i = threadIdx.x + blockIdx.x * blockDim.x;
+  int j = threadIdx.y + blockIdx.y * blockDim.y;
+
+  if (i < M && j < N) {
+    float accumulator = 0;
+
+    for (int k = 0; k < K; ++k) {
+      //accumulator += A[i + k * lda] * B[k + j * ldb];
+      // TN
+      accumulator += A[k + i * lda] * B[k + j * ldb];
+    }
+
+    C[i + j * ldc] = alpha * accumulator + beta * C[i + j * ldc];
+  }
+}
+
+/// Reference GEMM computation.
+template <typename TA, typename TB, typename TC, typename TI>
+cudaError_t ReferenceGemm(
+  int M,
+  int N,
+  int K,
+  TI alpha,
+  TA const *A,
+  int lda,
+  TB const *B,
+  int ldb,
+  TI beta,
+  TC *C,
+  int ldc) {
+
+  dim3 block(16, 16);
+  dim3 grid(
+    (M + block.x - 1) / block.x,
+    (N + block.y - 1) / block.y
+  );
+
+  ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+
+  return cudaGetLastError();
+}
+
+// Function to check if two host_vectors are approximately equal within atol and rtol
+template <typename T>
+bool is_close(const thrust::host_vector<T>& a, 
+              const thrust::host_vector<T>& b, 
+              T atol = static_cast<T>(1e-8f),
+              T rtol = static_cast<T>(1e-5f)) {
+    if (a.size() != b.size()) {
+        return false;  // Different sizes, cannot be equal
+    }
+
+    for (size_t i = 0; i < a.size(); ++i) {
+        T diff = static_cast<T>(std::abs(static_cast<float>(a[i] - b[i])));
+        T tol  = atol + rtol * static_cast<T>(std::abs(static_cast<float>(b[i])));
+        
+        if (diff > tol) {
+            std::cout << "Mismatch at index " << i << ": "
+                      << a[i] << " vs " << b[i] 
+                      << " (diff = " << diff << ", tol = " << tol << ")\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T>
+void print_host_vector_pretty(const thrust::host_vector<T>& vec, int width = 6, bool scientific = false, size_t max_elements = 6) {
+    std::cout << "[";
+    size_t n = vec.size();
+
+    if (n <= max_elements) {
+        // Print all elements if vector is small
+        for (size_t i = 0; i < n; ++i) {
+            if (scientific) {
+                std::cout << std::scientific << std::setprecision(4) << vec[i];
+            } else {
+                std::cout << std::setw(width) << vec[i];
+            }
+            if (i != n - 1) std::cout << ", ";
+        }
+    } else {
+        // Print first 3 and last 3 elements
+        for (size_t i = 0; i < 3; ++i) {
+            if (scientific) {
+                std::cout << std::scientific << std::setprecision(4) << vec[i];
+            } else {
+                std::cout << std::setw(width) << vec[i];
+            }
+            std::cout << ", ";
+        }
+        std::cout << "..., ";
+        for (size_t i = n - 3; i < n; ++i) {
+            if (scientific) {
+                std::cout << std::scientific << std::setprecision(4) << vec[i];
+            } else {
+                std::cout << std::setw(width) << vec[i];
+            }
+            if (i != n - 1) std::cout << ", ";
+        }
+    }
+    std::cout << "]" << std::endl;
+}
 
 int cute_wgmma_sm90_internal(int m, int n, int k, char transA, char transB)
 {
@@ -527,14 +822,18 @@ int cute_wgmma_sm90_internal(int m, int n, int k, char transA, char transB)
   thrust::host_vector<TB> h_B(n*k);
   thrust::host_vector<TC> h_C(m*n);
 
+  thrust::host_vector<TC> h_C_ref(m*n);
+
   // Initialize the tensors
   for (int j = 0; j < m*k; ++j) h_A[j] = TA(int((rand() % 2) ? 1 : -1));
   for (int j = 0; j < n*k; ++j) h_B[j] = TB(int((rand() % 2) ? 1 : -1));
   for (int j = 0; j < m*n; ++j) h_C[j] = TC(0);
+  for (int j = 0; j < m*n; ++j) h_C_ref[j] = TC(0);
 
   thrust::device_vector<TA> d_A = h_A;
   thrust::device_vector<TB> d_B = h_B;
   thrust::device_vector<TC> d_C = h_C;
+  thrust::device_vector<TC> d_C_ref = h_C_ref;
 
   double gflops = (2.0*m*n*k) * 1e-9;
 
@@ -559,6 +858,17 @@ int cute_wgmma_sm90_internal(int m, int n, int k, char transA, char transB)
     assert(false);
   }
 
+  // Run ref
+  d_C_ref = h_C_ref;
+  ReferenceGemm(m, n, k,
+       alpha,
+       d_A.data().get(), ldA,
+       d_B.data().get(), ldB,
+       beta,
+       d_C_ref.data().get(), ldC);
+  CUTE_CHECK_LAST();
+  thrust::host_vector<TC> ref_result = d_C_ref;
+
   // Run once
   d_C = h_C;
   gemm(transA, transB, m, n, k,
@@ -569,6 +879,11 @@ int cute_wgmma_sm90_internal(int m, int n, int k, char transA, char transB)
        d_C.data().get(), ldC);
   CUTE_CHECK_LAST();
   thrust::host_vector<TC> cute_result = d_C;
+
+  bool all_close = is_close<TC>(ref_result, cute_result);
+  printf("%d\n", all_close);
+  print_host_vector_pretty(ref_result);
+  print_host_vector_pretty(cute_result);
 
   // Timing iterations
   timer.start();
