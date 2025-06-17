@@ -30,6 +30,10 @@
  **************************************************************************************************/
 #pragma once
 
+#include <iomanip>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+
 #include "cuda_runtime.h"
 #include <iostream>
 
@@ -106,3 +110,123 @@ struct GpuTimer
         return elapsed;
     }
 };
+
+/// Naive reference GEMM computation.
+template <class TA, class TB, class TC,
+          class TI>
+__global__ void ReferenceGemm_kernel(
+  int M,
+  int N,
+  int K,
+  TI alpha,
+  TA const *A,
+  int lda,
+  TB const *B,
+  int ldb,
+  TI beta,
+  TC *C,
+  int ldc) {
+
+  int i = threadIdx.x + blockIdx.x * blockDim.x;
+  int j = threadIdx.y + blockIdx.y * blockDim.y;
+
+  if (i < M && j < N) {
+    float accumulator = 0;
+
+    for (int k = 0; k < K; ++k) {
+      //accumulator += A[i + k * lda] * B[k + j * ldb];
+      // TN
+      accumulator += A[k + i * lda] * B[k + j * ldb];
+    }
+
+    C[i + j * ldc] = alpha * accumulator + beta * C[i + j * ldc];
+  }
+}
+
+/// Reference GEMM computation.
+template <typename TA, typename TB, typename TC, typename TI>
+cudaError_t ReferenceGemm(
+  int M,
+  int N,
+  int K,
+  TI alpha,
+  TA const *A,
+  int lda,
+  TB const *B,
+  int ldb,
+  TI beta,
+  TC *C,
+  int ldc) {
+
+  dim3 block(16, 16);
+  dim3 grid(
+    (M + block.x - 1) / block.x,
+    (N + block.y - 1) / block.y
+  );
+
+  ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+
+  return cudaGetLastError();
+}
+
+// Function to check if two host_vectors are approximately equal within atol and rtol
+template <typename T>
+bool is_close(const thrust::host_vector<T>& a, 
+              const thrust::host_vector<T>& b, 
+              T atol = static_cast<T>(1e-8f),
+              T rtol = static_cast<T>(1e-5f)) {
+    if (a.size() != b.size()) {
+        return false;  // Different sizes, cannot be equal
+    }
+
+    for (size_t i = 0; i < a.size(); ++i) {
+        T diff = static_cast<T>(std::abs(static_cast<float>(a[i] - b[i])));
+        T tol  = atol + rtol * static_cast<T>(std::abs(static_cast<float>(b[i])));
+        
+        if (diff > tol) {
+            std::cout << "Mismatch at index " << i << ": "
+                      << a[i] << " vs " << b[i] 
+                      << " (diff = " << diff << ", tol = " << tol << ")\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T>
+void print_host_vector_pretty(const thrust::host_vector<T>& vec, int width = 6, bool scientific = false, size_t max_elements = 6) {
+    std::cout << "[";
+    size_t n = vec.size();
+
+    if (n <= max_elements) {
+        // Print all elements if vector is small
+        for (size_t i = 0; i < n; ++i) {
+            if (scientific) {
+                std::cout << std::scientific << std::setprecision(4) << vec[i];
+            } else {
+                std::cout << std::setw(width) << vec[i];
+            }
+            if (i != n - 1) std::cout << ", ";
+        }
+    } else {
+        // Print first 3 and last 3 elements
+        for (size_t i = 0; i < 3; ++i) {
+            if (scientific) {
+                std::cout << std::scientific << std::setprecision(4) << vec[i];
+            } else {
+                std::cout << std::setw(width) << vec[i];
+            }
+            std::cout << ", ";
+        }
+        std::cout << "..., ";
+        for (size_t i = n - 3; i < n; ++i) {
+            if (scientific) {
+                std::cout << std::scientific << std::setprecision(4) << vec[i];
+            } else {
+                std::cout << std::setw(width) << vec[i];
+            }
+            if (i != n - 1) std::cout << ", ";
+        }
+    }
+    std::cout << "]" << std::endl;
+}

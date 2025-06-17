@@ -51,6 +51,7 @@ ext_modules.append(
             "tutorials/01_cutlass_utilities.cu",
 
             "tutorials/cute/wgmma_sm90.cu",
+            "tutorials/cute/wgmma_tma_sm90.cu",
 
             "csrc/flash_api.cpp",
             "tutorials/flash_attn/flash_fwd_hdim128_bf16_sm90.cu",

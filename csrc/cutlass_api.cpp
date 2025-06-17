@@ -13,9 +13,14 @@ int cute_wgmma_sm90(int m, int n, int k, char transA, char transB){
     return cute_wgmma_sm90_internal(m, n, k, transA, transB);
 }
 
+int cute_wgmma_tma_sm90(int m, int n, int k, char transA, char transB){
+    return cute_wgmma_tma_sm90_internal(m, n, k, transA, transB);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Cutlass Tutorial";
     m.def("basic_gemm", &basic_gemm); // 00
     m.def("cutlass_utilities", &cutlass_utilities); // 01
     m.def("cute_wgmma_sm90", &cute_wgmma_sm90);
+    m.def("cute_wgmma_tma_sm90", &cute_wgmma_tma_sm90);
 }
