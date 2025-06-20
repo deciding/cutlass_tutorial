@@ -34,6 +34,8 @@ template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, 
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
+    static constexpr bool kMmaPV_is_RS = MmaPV_is_RS;
+    static constexpr int kkHeadDimV = kHeadDimV;
     using ClusterShape = ClusterShape_;
     using TileShape_MNK = TileShape_MNK_;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
@@ -670,6 +672,37 @@ struct CollectiveMainloopFwdSm90 {
         auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
         Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
         Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K.partition_D(sK));  // (TMA, PIPE)
+
+#if 0
+        if(thread0()){
+            print(gQ);
+            print("\n");
+            print(block_tma_Q);
+            print("\n");
+            print(block_tma_Q.partition_S(gQ));
+            print("\n");
+            print(tQgQ);
+            print("\n");
+            print(sQ);
+            print("\n");
+            print(tQsQ);
+            print("\n");
+
+            print(gK_TMA);
+            print("\n");
+            print(block_tma_K);
+            print("\n");
+            print(block_tma_K.partition_S(gK_TMA));
+            print("\n");
+            print(tKgK_TMA);
+            print("\n");
+            print(sK);
+            print("\n");
+            print(tKsK_TMA);
+            print("\n");
+        }
+#endif
+
         auto block_tma_V = params.tma_load_V.get_slice(cluster_local_block_id.x);
         Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k, batch)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
@@ -1040,6 +1073,31 @@ struct CollectiveMainloopFwdSm90 {
         Tensor taccOcO = thread_mma_pv.partition_C(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
         Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
         Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
+#if 0
+        if (threadIdx.x == 128 && blockIdx.x == 0 && blockIdx.y == 0 &&blockIdx.z == 0){
+            //print(wg_mma_qk); print("\n");
+            //print(sQ); print("\n");
+            //print(wg_mma_qk.partition_A(sQ)); print("\n");
+            //print(tSrQ); print("\n");
+            //print(sK); print("\n");
+            //print(tSrK); print("\n");
+            //print("\n");
+            print(wg_mma_pv); print("\n");
+            print(sV); print("\n");
+            print(wg_mma_pv.partition_B(sV)); print("\n");
+            print(tOrV); print("\n");
+            print(sP); print("\n");
+            print(wg_mma_pv.partition_A(sP)); print("\n");
+            print(tOsP); print("\n");
+            //print("\n");
+            //print(thread_mma_pv); print("\n");
+            //print(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{}))); print("\n");
+            //print(taccOcO); print("\n");
+            //print(flash::convert_layout_acc_rowcol(taccOcO.layout())); print("\n");
+            //print(taccOcO_rowcol); print("\n");
+            //print(taccOcO_row); print("\n");
+        }
+#endif
         auto store_scales = [&](auto& scales, int stage) {
             static_assert(CUTE_STATIC_V(size(scales)) == CUTE_STATIC_V(size(taccOcO_row)));
             #pragma unroll

@@ -440,10 +440,6 @@ gemm_tn(int m, int n, int k,
   Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));
   Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN,bK));
 
-  if (thread0()){
-      auto cta_v_tile = make_identity_layout(shape(mA)).compose(make_shape(bM,bK));
-  }
-
   //
   // Setup and Launch
   //

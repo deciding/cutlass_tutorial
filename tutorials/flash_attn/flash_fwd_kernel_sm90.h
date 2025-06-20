@@ -79,6 +79,9 @@ public:
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
+    // Sometimes need more registers for printing in WG0
+    //static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 40 : 40) : 32);
+    //static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 232 : 232) : 160);
     static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
     static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
     // If you want to print from the producer warp, you'd need to increase the number of registers
@@ -291,6 +294,25 @@ public:
             pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
         }
         auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+
+        //if (thread0()){
+        //    using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK; // 128 176 128
+        //    using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV; // 128 128 176
+        //    print((int)CollectiveMainloop::MmaMajorV); // MN
+        //    print((int)CollectiveMainloop::TmaMajorV); // MN
+        //    print(SmemLayoutAtomVt{}); // (64, 8) MN_SW128
+        //    print(SmemLayoutAtomQ{}); // (8, 64) K_SW128
+        //    print(SmemLayoutAtomK{}); // (8, 64) K_SW128
+        //    print(SameHeadDim); // true
+        //    print("\n");
+        //    print(Transpose_V); // false
+        //    print("\n");
+        //    print(AppendKV); // false
+        //    print("\n");
+
+        //    print("\n");
+        //}
+
 
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
