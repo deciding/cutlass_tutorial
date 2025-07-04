@@ -34,5 +34,5 @@ def cute_wgmma_tma_sm90(
 if __name__ == "__main__":
     #print(basic_gemm(1024, 1024, 1024, 1.0, 0.0))
     #print(cutlass_utilities(1024, 1024, 1024, 1.0, 0.0))
-    #print(cute_wgmma_sm90(5120, 5120, 4096, True, False))
-    print(cute_wgmma_tma_sm90(5120, 5120, 4096, True, False))
+    print(cute_wgmma_sm90(5120, 5120, 4096, True, False))
+    #print(cute_wgmma_tma_sm90(5120, 5120, 4096, True, False))

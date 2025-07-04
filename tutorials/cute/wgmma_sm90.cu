@@ -474,6 +474,11 @@ gemm_tn(int m, int n, int k,
   auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
   auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
 
+  if (thread0()){
+      print(GMMA::Layout_K_SW128_Atom<TA>{});
+      print("\n");
+  }
+
   // Define the thread layouts (static)
   TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
                                     Layout<Shape<_16,_8>,Stride<_8,_1>>{}, // Thr layout 16x8 k-major
