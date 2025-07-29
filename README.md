@@ -4,4 +4,8 @@
 python setup.py develop
 python python/cutlass_interface.py
 python python/flash_attn_interface.py
+
+# for cute dsl
+pip install nvidia-cutlass-dsl
+python python/cute_flash_attn_interface.py
 ```
