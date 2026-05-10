@@ -22,6 +22,169 @@ from cutlass._mlir.dialects import llvm, arith
 from cutlass._mlir import ir
 from cutlass.cute.runtime import from_dlpack
 
+# Smem Rem -> Segment (rem / warp) -> index inside segment
+@cute.jit
+def clock_record(
+        clock_ptr,
+        clock_idx: cutlass.Int32,
+        seg_idx: cutlass.Int32,
+        segment_size: cutlass.Int32,
+    ):
+    clock_idx = cutlass.Int32(clock_idx)
+    seg_idx = cutlass.Int32(seg_idx)
+    segment_size = cutlass.Int32(segment_size)
+    # Extract the raw !llvm.ptr<3> ir.Value
+    # (attribute name is `.ir_value` in CUTLASS 4.x)
+    smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
+    # Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
+    i32 = ir.IntegerType.get_signless(32)
+    i64 = ir.IntegerType.get_signless(64)
+
+    wthreads = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 32)).result
+    zero = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
+
+    #smem_base_i32 = llvm.ptrtoint(i32, smem_base_llvm)   # ptr<3> → i32
+    smem_base_i32 = llvm.PtrToIntOp(i32, smem_base_llvm).result   # ptr<3> → i32
+
+    # Compute per-thread offset: base + tidx * 8  (8 bytes per u64)
+    # tidx is a cutlass.Int32, grab its ir.Value
+    entry_size = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
+
+    seg_base_off = llvm.MulOp(seg_idx, segment_size, 0).result
+    clock_off0 = llvm.MulOp(clock_idx, entry_size, 0).result
+    clock_off = llvm.URemOp(clock_off0, segment_size).result
+
+    byte_off = llvm.AddOp(seg_base_off, clock_off, 0).result
+    smem_addr  = llvm.AddOp(smem_base_i32, byte_off, 0).result  # per-thread addr
+
+    # ---- 1. Read clock registers ----------------------------------------
+    # mov.u32  %dest, %clock;   (low 32 bits)
+    # mov.u32  %dest, %clock_hi; (high 32 bits)
+    # Output constraint "=r" → 32-bit int register
+    clock_lo = llvm.inline_asm(
+        i32,
+        [],
+        asm_string="mov.u32 $0, %clock;",
+        constraints="=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+    clock_hi = llvm.inline_asm(
+        i32,
+        [],
+        asm_string="mov.u32 $0, %clock_hi;",
+        constraints="=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+    tidx, _, _ = cute.arch.thread_idx()
+    #p = cutlass.Boolean((tidx % 32) == 0)
+    #p = cutlass.Boolean(True)
+    tidx_in_warp = llvm.URemOp(tidx, wthreads).result
+    p = llvm.ICmpOp(llvm.ICmpPredicate.eq, tidx_in_warp, zero).result
+
+    #cute.printf("cur {}: %p %p", tidx, clock_lo, clock_hi)
+    cute.printf("cur {}: {} {}", tidx, clock_lo, clock_hi)
+
+    # ---- 3. REG → SMEM (st.shared.v2) ----------------------------------
+    # For v2, we need to pass two 32-bit registers that form the 64-bit value
+    llvm.inline_asm(
+        None,
+        [smem_addr, clock_lo, clock_hi, p],
+        asm_string="@$3 st.shared.v2.b32 [$0], {$1, $2};",
+        constraints="r,r,r,b",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+@cute.jit
+def finanlize_clock(
+        clock_ptr,
+        out_ptr,
+        seg_idx: cutlass.Int32,
+        segment_size: cutlass.Int32,
+    ):
+    seg_idx = cutlass.Int32(seg_idx)
+    segment_size = cutlass.Int32(segment_size)
+    # Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
+    i32 = ir.IntegerType.get_signless(32)
+    i64 = ir.IntegerType.get_signless(64)
+
+    smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
+    #smem_base_i32 = llvm.ptrtoint(i32, smem_base_llvm)   # ptr<3> → i32
+    smem_base_i32 = llvm.PtrToIntOp(i32, smem_base_llvm).result   # ptr<3> → i32
+    # Compute per-thread offset: base + tidx * 8  (8 bytes per u64)
+    # tidx is a cutlass.Int32, grab its ir.Value
+    entry_size = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
+    four = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 4)).result
+    seg_base_off = llvm.MulOp(seg_idx, segment_size, 0).result
+    byte_off = seg_base_off
+
+    # out is a cute.Tensor (generic ptr, addrspace 0 after DLPack conversion)
+    # out.iterator is the cute.Pointer; its ir_value is !llvm.ptr (generic)
+    gmem_base_llvm = out_ptr.llvm_ptr
+    gmem_base_i64  = llvm.PtrToIntOp(i64, gmem_base_llvm).result
+    entry_size_i64 = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 8)).result
+    four_i64 = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 4)).result
+    byte_off_i64 = llvm.ZExtOp(i64, seg_base_off).result
+
+    clock_cnt = llvm.UDivOp(segment_size, entry_size).result
+
+    for clock_idx in cutlass.range(clock_cnt):
+
+        smem_addr0  = llvm.AddOp(smem_base_i32, byte_off, 0).result
+
+        loaded0 = llvm.inline_asm(
+            i64,
+            [smem_addr0],
+            asm_string="ld.shared.b32 $0, [$1];",
+            constraints="=l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+        gmem_addr0  = llvm.AddOp(gmem_base_i64, byte_off_i64, 0).result
+
+        llvm.inline_asm(
+            None,
+            [gmem_addr0, loaded0],
+            asm_string="st.global.b32 [$0], $1;",
+            constraints="l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+        smem_addr1 = llvm.AddOp(smem_addr0, four, 0).result
+        loaded1 = llvm.inline_asm(
+            i64,
+            [smem_addr1],
+            asm_string="ld.shared.b32 $0, [$1];",
+            constraints="=l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+        gmem_addr1  = llvm.AddOp(gmem_addr0, four_i64, 0).result
+        llvm.inline_asm(
+            None,
+            [gmem_addr1, loaded1],
+            asm_string="st.global.b32 [$0], $1;",
+            constraints="l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+        byte_off = llvm.AddOp(byte_off, entry_size, 0).result
+        byte_off_i64 = llvm.AddOp(byte_off_i64, entry_size_i64, 0).result
 
 # ---------------------------------------------------------------------------
 # 1.  Shared-memory layout struct
@@ -50,6 +213,8 @@ def clock_kernel(out: cute.Tensor):
       - stores register → gmem out[tidx]
     """
     tidx, _, _ = cute.arch.thread_idx()
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
     # ---- allocate smem -------------------------------------------------
     smem    = cutlass.utils.SmemAllocator()
@@ -59,130 +224,141 @@ def clock_kernel(out: cute.Tensor):
     # .data_ptr() gives the base cute.Pointer of that field
     clock_ptr = storage.clock_buf.data_ptr()
 
-    # Extract the raw !llvm.ptr<3> ir.Value
-    # (attribute name is `.ir_value` in CUTLASS 4.x)
-    smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
+    clock_record(clock_ptr, 0, warp_idx, 8)
 
-    # Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
-    i32 = ir.IntegerType.get_signless(32)
-    i64 = ir.IntegerType.get_signless(64)
+    ## Extract the raw !llvm.ptr<3> ir.Value
+    ## (attribute name is `.ir_value` in CUTLASS 4.x)
+    #smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
 
-    #smem_base_i32 = llvm.ptrtoint(i32, smem_base_llvm)   # ptr<3> → i32
-    smem_base_i32 = llvm.PtrToIntOp(i32, smem_base_llvm).result   # ptr<3> → i32
+    ## Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
+    #i32 = ir.IntegerType.get_signless(32)
+    #i64 = ir.IntegerType.get_signless(64)
 
-    # Compute per-thread offset: base + tidx * 8  (8 bytes per u64)
-    # tidx is a cutlass.Int32, grab its ir.Value
-    tidx_val   = tidx # i32
-    eight = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
+    ##smem_base_i32 = llvm.ptrtoint(i32, smem_base_llvm)   # ptr<3> → i32
+    #smem_base_i32 = llvm.PtrToIntOp(i32, smem_base_llvm).result   # ptr<3> → i32
 
-    byte_off = llvm.MulOp(tidx_val, eight, 0).result
-    smem_addr  = llvm.AddOp(smem_base_i32, byte_off, 0).result  # per-thread addr
+    ## Compute per-thread offset: base + tidx * 8  (8 bytes per u64)
+    ## tidx is a cutlass.Int32, grab its ir.Value
+    #tidx_val   = tidx # i32
+    #eight = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
 
-    # ---- 1. Read clock registers ----------------------------------------
-    # mov.u32  %dest, %clock;   (low 32 bits)
-    # mov.u32  %dest, %clock_hi; (high 32 bits)
-    # Output constraint "=r" → 32-bit int register
-    clock_lo = llvm.inline_asm(
-        i32,
-        [],
-        asm_string="mov.u32 $0, %clock;",
-        constraints="=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    #byte_off = llvm.MulOp(tidx_val, eight, 0).result
+    #smem_addr  = llvm.AddOp(smem_base_i32, byte_off, 0).result  # per-thread addr
 
-    clock_hi = llvm.inline_asm(
-        i32,
-        [],
-        asm_string="mov.u32 $0, %clock_hi;",
-        constraints="=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    ## ---- 1. Read clock registers ----------------------------------------
+    ## mov.u32  %dest, %clock;   (low 32 bits)
+    ## mov.u32  %dest, %clock_hi; (high 32 bits)
+    ## Output constraint "=r" → 32-bit int register
+    #clock_lo = llvm.inline_asm(
+    #    i32,
+    #    [],
+    #    asm_string="mov.u32 $0, %clock;",
+    #    constraints="=r",
+    #    has_side_effects=True,
+    #    is_align_stack=False,
+    #    asm_dialect=llvm.AsmDialect.AD_ATT,
+    #)
 
-    cute.printf("cur {}: {} {}", tidx, clock_lo, clock_hi)
+    #clock_hi = llvm.inline_asm(
+    #    i32,
+    #    [],
+    #    asm_string="mov.u32 $0, %clock_hi;",
+    #    constraints="=r",
+    #    has_side_effects=True,
+    #    is_align_stack=False,
+    #    asm_dialect=llvm.AsmDialect.AD_ATT,
+    #)
 
-    # ---- 2. Combine clock_lo and clock_hi into b64 --------------------
-    # b64 = (clock_hi << 32) | clock_lo
-    clock_lo_i64 = llvm.ZExtOp(i64, clock_lo).result
-    clock_hi_i64 = llvm.ZExtOp(i64, clock_hi).result
-    thirty_two = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 32)).result
-    clock_hi_shift = llvm.ShlOp(clock_hi_i64, thirty_two, 0).result
-    clock_b64 = llvm.OrOp(clock_lo_i64, clock_hi_shift).result
+    #cute.printf("cur {}: {} {}", tidx, clock_lo, clock_hi)
 
-    # ---- 3. REG → SMEM (st.shared.v2) ----------------------------------
-    # For v2, we need to pass two 32-bit registers that form the 64-bit value
-    llvm.inline_asm(
-        None,
-        [smem_addr, clock_lo, clock_hi],
-        asm_string="st.shared.v2.b32 [$0], {$1, $2};",
-        constraints="r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    ## ---- 2. Combine clock_lo and clock_hi into b64 --------------------
+    ## b64 = (clock_hi << 32) | clock_lo
+    #clock_lo_i64 = llvm.ZExtOp(i64, clock_lo).result
+    #clock_hi_i64 = llvm.ZExtOp(i64, clock_hi).result
+    #thirty_two = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 32)).result
+    #clock_hi_shift = llvm.ShlOp(clock_hi_i64, thirty_two, 0).result
+    #clock_b64 = llvm.OrOp(clock_lo_i64, clock_hi_shift).result
+
+    ## ---- 3. REG → SMEM (st.shared.v2) ----------------------------------
+    ## For v2, we need to pass two 32-bit registers that form the 64-bit value
+    #llvm.inline_asm(
+    #    None,
+    #    [smem_addr, clock_lo, clock_hi],
+    #    asm_string="st.shared.v2.b32 [$0], {$1, $2};",
+    #    constraints="r,r,r",
+    #    has_side_effects=True,
+    #    is_align_stack=False,
+    #    asm_dialect=llvm.AsmDialect.AD_ATT,
+    #)
+
+
+
 
     # Optional: barrier so all threads have written before any reads back
     cute.arch.sync_threads()
 
+
+
+
     # ---- 4. SMEM → REG -> GMEM-------------------------------------------------
-    loaded0 = llvm.inline_asm(
-        i64,
-        [smem_addr],
-        asm_string="ld.shared.b32 $0, [$1];",
-        constraints="=l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    out_ptr = out.iterator
+    finanlize_clock(clock_ptr, out_ptr, warp_idx, 8)
 
-    # out is a cute.Tensor (generic ptr, addrspace 0 after DLPack conversion)
-    # out.iterator is the cute.Pointer; its ir_value is !llvm.ptr (generic)
-    gmem_base_llvm = out.iterator.llvm_ptr
-    gmem_base_i64  = llvm.PtrToIntOp(i64, gmem_base_llvm).result
+    #loaded0 = llvm.inline_asm(
+    #    i64,
+    #    [smem_addr],
+    #    asm_string="ld.shared.b32 $0, [$1];",
+    #    constraints="=l,r",
+    #    has_side_effects=True,
+    #    is_align_stack=False,
+    #    asm_dialect=llvm.AsmDialect.AD_ATT,
+    #)
 
-    # Per-thread byte offset in i64 (8 bytes for u64)
-    tidx_i64  = llvm.ZExtOp(i64, tidx_val).result
-    eight_i64  = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 8)).result
-    byte_off64 = llvm.MulOp(tidx_i64, eight_i64, 0).result
-    gmem_addr0  = llvm.AddOp(gmem_base_i64, byte_off64, 0).result
+    ## out is a cute.Tensor (generic ptr, addrspace 0 after DLPack conversion)
+    ## out.iterator is the cute.Pointer; its ir_value is !llvm.ptr (generic)
+    #gmem_base_llvm = out.iterator.llvm_ptr
+    #gmem_base_i64  = llvm.PtrToIntOp(i64, gmem_base_llvm).result
 
-    llvm.inline_asm(
-        None,
-        [gmem_addr0, loaded0],
-        asm_string="st.global.b32 [$0], $1;",
-        constraints="l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    ## Per-thread byte offset in i64 (8 bytes for u64)
+    #tidx_i64  = llvm.ZExtOp(i64, tidx_val).result
+    #eight_i64  = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 8)).result
+    #byte_off64 = llvm.MulOp(tidx_i64, eight_i64, 0).result
+    #gmem_addr0  = llvm.AddOp(gmem_base_i64, byte_off64, 0).result
 
-    four = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 4)).result
-    smem_addr1 = llvm.AddOp(smem_addr, four, 0).result  # per-thread addr
-    loaded1 = llvm.inline_asm(
-        i64,
-        [smem_addr1],
-        asm_string="ld.shared.b32 $0, [$1];",
-        constraints="=l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    #llvm.inline_asm(
+    #    None,
+    #    [gmem_addr0, loaded0],
+    #    asm_string="st.global.b32 [$0], $1;",
+    #    constraints="l,l",
+    #    has_side_effects=True,
+    #    is_align_stack=False,
+    #    asm_dialect=llvm.AsmDialect.AD_ATT,
+    #)
 
-    four_i64  = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 4)).result
-    gmem_addr1  = llvm.AddOp(gmem_addr0, four_i64, 0).result
+    #four = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 4)).result
+    #smem_addr1 = llvm.AddOp(smem_addr, four, 0).result  # per-thread addr
+    #loaded1 = llvm.inline_asm(
+    #    i64,
+    #    [smem_addr1],
+    #    asm_string="ld.shared.b32 $0, [$1];",
+    #    constraints="=l,r",
+    #    has_side_effects=True,
+    #    is_align_stack=False,
+    #    asm_dialect=llvm.AsmDialect.AD_ATT,
+    #)
 
-    llvm.inline_asm(
-        None,
-        [gmem_addr1, loaded1],
-        asm_string="st.global.b32 [$0], $1;",
-        constraints="l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    #four_i64  = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 4)).result
+    #gmem_addr1  = llvm.AddOp(gmem_addr0, four_i64, 0).result
+
+    #llvm.inline_asm(
+    #    None,
+    #    [gmem_addr1, loaded1],
+    #    asm_string="st.global.b32 [$0], $1;",
+    #    constraints="l,l",
+    #    has_side_effects=True,
+    #    is_align_stack=False,
+    #    asm_dialect=llvm.AsmDialect.AD_ATT,
+    #)
 
 @cute.jit
 def clock(out: cute.Tensor):
@@ -240,7 +416,18 @@ if __name__ == "__main__":
     clocks = run_clock_kernel(num_threads=NUM_THREADS, num_blocks=1)
 
     print(f"\nClock values per thread (int64 view of u64 bits):")
-    print(clocks)
+    high_bits = (clocks >> 32).to(torch.int32)
+    low_bits = (clocks & 0xFFFFFFFF).to(torch.int32)
+    print("Original (64-bit):")
+    #print([hex(x.item()) for x in clocks])
+    print([(x.item()) for x in clocks])
+    print("\nHigh 32 bits:")
+    #print([hex(x.item()) for x in high_bits])
+    print([(x.item()) for x in high_bits])
+    print("\nLow 32 bits:")
+    #print([hex(x.item()) for x in low_bits])
+    print([(x.item()) for x in low_bits])
+
 
     # Sanity: values should be non-zero and roughly increasing with tid
     # (monotonically only if threads execute serially; in practice they
