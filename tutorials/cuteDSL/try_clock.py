@@ -22,15 +22,13 @@ from cutlass._mlir.dialects import llvm, arith
 from cutlass._mlir import ir
 from cutlass.cute.runtime import from_dlpack
 
-# Smem Rem -> Segment (rem / warp) -> index inside segment
 @cute.jit
-def clock_record(
+def init_clock(
         clock_ptr,
-        clock_idx: cutlass.Int32,
+        out_ptr,
         seg_idx: cutlass.Int32,
         segment_size: cutlass.Int32,
     ):
-    clock_idx = cutlass.Int32(clock_idx)
     seg_idx = cutlass.Int32(seg_idx)
     segment_size = cutlass.Int32(segment_size)
     # Extract the raw !llvm.ptr<3> ir.Value
@@ -51,11 +49,58 @@ def clock_record(
     entry_size = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
 
     seg_base_off = llvm.MulOp(seg_idx, segment_size, 0).result
+    seg_addr  = llvm.AddOp(smem_base_i32, seg_base_off, 0).result  # per-thread addr
+
+    gmem_base_llvm = out_ptr.llvm_ptr
+    gmem_base_i64  = llvm.PtrToIntOp(i64, gmem_base_llvm).result
+    seg_base_off_i64 = llvm.ZExtOp(i64, seg_base_off).result
+    out_addr  = llvm.AddOp(gmem_base_i64, seg_base_off_i64, 0).result  # per-thread addr
+
+    tidx, _, _ = cute.arch.thread_idx()
+    tidx_in_warp = llvm.URemOp(tidx, wthreads).result
+    is_leader_thread = llvm.ICmpOp(llvm.ICmpPredicate.eq, tidx_in_warp, zero).result
+
+    return seg_addr, out_addr, is_leader_thread
+
+
+# Smem Rem -> Segment (rem / warp) -> index inside segment
+@cute.jit
+def clock_record(
+        #clock_ptr,
+        seg_addr,
+        clock_idx: cutlass.Int32,
+        is_leader_thread,
+        #seg_idx: cutlass.Int32,
+        segment_size: cutlass.Int32,
+    ):
+    clock_idx = cutlass.Int32(clock_idx)
+    #seg_idx = cutlass.Int32(seg_idx)
+    segment_size = cutlass.Int32(segment_size)
+
+    ## Extract the raw !llvm.ptr<3> ir.Value
+    ## (attribute name is `.ir_value` in CUTLASS 4.x)
+    #smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
+    ## Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
+    i32 = ir.IntegerType.get_signless(32)
+    i64 = ir.IntegerType.get_signless(64)
+
+    #wthreads = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 32)).result
+    #zero = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
+
+    ##smem_base_i32 = llvm.ptrtoint(i32, smem_base_llvm)   # ptr<3> → i32
+    #smem_base_i32 = llvm.PtrToIntOp(i32, smem_base_llvm).result   # ptr<3> → i32
+
+    # Compute per-thread offset: base + tidx * 8  (8 bytes per u64)
+    # tidx is a cutlass.Int32, grab its ir.Value
+    entry_size = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
+
+    #seg_base_off = llvm.MulOp(seg_idx, segment_size, 0).result
+
     clock_off0 = llvm.MulOp(clock_idx, entry_size, 0).result
     clock_off = llvm.URemOp(clock_off0, segment_size).result
-
-    byte_off = llvm.AddOp(seg_base_off, clock_off, 0).result
-    smem_addr  = llvm.AddOp(smem_base_i32, byte_off, 0).result  # per-thread addr
+    #byte_off = llvm.AddOp(seg_base_off, clock_off, 0).result
+    #smem_addr  = llvm.AddOp(smem_base_i32, byte_off, 0).result  # per-thread addr
+    smem_addr  = llvm.AddOp(seg_addr, clock_off, 0).result  # per-thread addr
 
     # ---- 1. Read clock registers ----------------------------------------
     # mov.u32  %dest, %clock;   (low 32 bits)
@@ -82,19 +127,18 @@ def clock_record(
     )
 
     tidx, _, _ = cute.arch.thread_idx()
-    #p = cutlass.Boolean((tidx % 32) == 0)
-    #p = cutlass.Boolean(True)
-    tidx_in_warp = llvm.URemOp(tidx, wthreads).result
-    p = llvm.ICmpOp(llvm.ICmpPredicate.eq, tidx_in_warp, zero).result
-
-    #cute.printf("cur {}: %p %p", tidx, clock_lo, clock_hi)
     cute.printf("cur {}: {} {}", tidx, clock_lo, clock_hi)
+    ##p = cutlass.Boolean((tidx % 32) == 0)
+    ##p = cutlass.Boolean(True)
+    #tidx_in_warp = llvm.URemOp(tidx, wthreads).result
+    #p = llvm.ICmpOp(llvm.ICmpPredicate.eq, tidx_in_warp, zero).result
+
 
     # ---- 3. REG → SMEM (st.shared.v2) ----------------------------------
     # For v2, we need to pass two 32-bit registers that form the 64-bit value
     llvm.inline_asm(
         None,
-        [smem_addr, clock_lo, clock_hi, p],
+        [smem_addr, clock_lo, clock_hi, is_leader_thread],
         asm_string="@$3 st.shared.v2.b32 [$0], {$1, $2};",
         constraints="r,r,r,b",
         has_side_effects=True,
@@ -104,44 +148,56 @@ def clock_record(
 
 @cute.jit
 def finanlize_clock(
-        clock_ptr,
-        out_ptr,
-        seg_idx: cutlass.Int32,
+        #clock_ptr,
+        #out_ptr,
+        seg_addr,
+        out_addr,
+        #seg_idx: cutlass.Int32,
         segment_size: cutlass.Int32,
     ):
-    seg_idx = cutlass.Int32(seg_idx)
+    #seg_idx = cutlass.Int32(seg_idx)
     segment_size = cutlass.Int32(segment_size)
-    # Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
+
+    ## Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
     i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
-
-    smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
-    #smem_base_i32 = llvm.ptrtoint(i32, smem_base_llvm)   # ptr<3> → i32
-    smem_base_i32 = llvm.PtrToIntOp(i32, smem_base_llvm).result   # ptr<3> → i32
-    # Compute per-thread offset: base + tidx * 8  (8 bytes per u64)
-    # tidx is a cutlass.Int32, grab its ir.Value
-    entry_size = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
     four = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 4)).result
-    seg_base_off = llvm.MulOp(seg_idx, segment_size, 0).result
-    byte_off = seg_base_off
-
-    # out is a cute.Tensor (generic ptr, addrspace 0 after DLPack conversion)
-    # out.iterator is the cute.Pointer; its ir_value is !llvm.ptr (generic)
-    gmem_base_llvm = out_ptr.llvm_ptr
-    gmem_base_i64  = llvm.PtrToIntOp(i64, gmem_base_llvm).result
-    entry_size_i64 = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 8)).result
     four_i64 = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 4)).result
-    byte_off_i64 = llvm.ZExtOp(i64, seg_base_off).result
+    zero = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
+    zero_i64 = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 0)).result
+    entry_size = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 8)).result
+    entry_size_i64 = llvm.ConstantOp(i64, ir.IntegerAttr.get(i64, 8)).result
+
+    #seg_addr  = llvm.AddOp(seg_addr, zero, 0).result  # per-thread addr
+    #out_addr  = llvm.AddOp(out_addr, zero_i64, 0).result  # per-thread addr
+
+    #smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
+    ##smem_base_i32 = llvm.ptrtoint(i32, smem_base_llvm)   # ptr<3> → i32
+    #smem_base_i32 = llvm.PtrToIntOp(i32, smem_base_llvm).result   # ptr<3> → i32
+    ## Compute per-thread offset: base + tidx * 8  (8 bytes per u64)
+    ## tidx is a cutlass.Int32, grab its ir.Value
+    #seg_base_off = llvm.MulOp(seg_idx, segment_size, 0).result
+    #byte_off = seg_base_off
+    byte_off = zero
+
+    ## out is a cute.Tensor (generic ptr, addrspace 0 after DLPack conversion)
+    ## out.iterator is the cute.Pointer; its ir_value is !llvm.ptr (generic)
+    #gmem_base_llvm = out_ptr.llvm_ptr
+    #gmem_base_i64  = llvm.PtrToIntOp(i64, gmem_base_llvm).result
+    #byte_off_i64 = llvm.ZExtOp(i64, seg_base_off).result
+    byte_off_i64 = zero_i64
 
     clock_cnt = llvm.UDivOp(segment_size, entry_size).result
 
     for clock_idx in cutlass.range(clock_cnt):
 
-        smem_addr0  = llvm.AddOp(smem_base_i32, byte_off, 0).result
+        #smem_addr0  = llvm.AddOp(smem_base_i32, byte_off, 0).result
+        smem_addr0  = llvm.AddOp(seg_addr, byte_off, 0).result
 
         loaded0 = llvm.inline_asm(
             i64,
             [smem_addr0],
+            #[seg_addr],
             asm_string="ld.shared.b32 $0, [$1];",
             constraints="=l,r",
             has_side_effects=True,
@@ -149,11 +205,13 @@ def finanlize_clock(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
-        gmem_addr0  = llvm.AddOp(gmem_base_i64, byte_off_i64, 0).result
+        #gmem_addr0  = llvm.AddOp(gmem_base_i64, byte_off_i64, 0).result
+        gmem_addr0  = llvm.AddOp(out_addr, byte_off_i64, 0).result
 
         llvm.inline_asm(
             None,
             [gmem_addr0, loaded0],
+            #[out_addr, loaded0],
             asm_string="st.global.b32 [$0], $1;",
             constraints="l,l",
             has_side_effects=True,
@@ -162,9 +220,11 @@ def finanlize_clock(
         )
 
         smem_addr1 = llvm.AddOp(smem_addr0, four, 0).result
+        #seg_addr1 = llvm.AddOp(seg_addr, four, 0).result
         loaded1 = llvm.inline_asm(
             i64,
             [smem_addr1],
+            #[seg_addr1],
             asm_string="ld.shared.b32 $0, [$1];",
             constraints="=l,r",
             has_side_effects=True,
@@ -173,9 +233,12 @@ def finanlize_clock(
         )
 
         gmem_addr1  = llvm.AddOp(gmem_addr0, four_i64, 0).result
+        #out_addr1  = llvm.AddOp(out_addr, four_i64, 0).result
+
         llvm.inline_asm(
             None,
             [gmem_addr1, loaded1],
+            #[out_addr1, loaded1],
             asm_string="st.global.b32 [$0], $1;",
             constraints="l,l",
             has_side_effects=True,
@@ -185,6 +248,8 @@ def finanlize_clock(
 
         byte_off = llvm.AddOp(byte_off, entry_size, 0).result
         byte_off_i64 = llvm.AddOp(byte_off_i64, entry_size_i64, 0).result
+        #seg_addr = llvm.AddOp(seg_addr, entry_size, 0).result
+        #out_addr = llvm.AddOp(out_addr, entry_size_i64, 0).result
 
 # ---------------------------------------------------------------------------
 # 1.  Shared-memory layout struct
@@ -223,8 +288,12 @@ def clock_kernel(out: cute.Tensor):
     # storage.clock_buf is a cute.Pointer  (addrspace 3, dtype Uint32)
     # .data_ptr() gives the base cute.Pointer of that field
     clock_ptr = storage.clock_buf.data_ptr()
+    out_ptr = out.iterator
 
-    clock_record(clock_ptr, 0, warp_idx, 8)
+    seg_addr, out_addr, is_leader_thread = init_clock(clock_ptr, out_ptr, warp_idx, 8)
+
+    #clock_record(clock_ptr, 0, warp_idx, 8)
+    clock_record(seg_addr, 0, is_leader_thread, 8)
 
     ## Extract the raw !llvm.ptr<3> ir.Value
     ## (attribute name is `.ir_value` in CUTLASS 4.x)
@@ -301,8 +370,8 @@ def clock_kernel(out: cute.Tensor):
 
 
     # ---- 4. SMEM → REG -> GMEM-------------------------------------------------
-    out_ptr = out.iterator
-    finanlize_clock(clock_ptr, out_ptr, warp_idx, 8)
+    #finanlize_clock(clock_ptr, out_ptr, warp_idx, 8)
+    finanlize_clock(seg_addr, out_addr, 8)
 
     #loaded0 = llvm.inline_asm(
     #    i64,
