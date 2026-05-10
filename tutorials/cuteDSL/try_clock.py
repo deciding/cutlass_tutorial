@@ -18,6 +18,8 @@ Requirements:
 import torch
 import cutlass
 import cutlass.cute as cute
+from cutlass import const_expr
+
 from cutlass._mlir.dialects import llvm, arith
 from cutlass._mlir import ir
 from cutlass.cute.runtime import from_dlpack
@@ -67,8 +69,10 @@ def init_clock(
 @cute.jit
 def clock_record(
         #clock_ptr,
-        seg_addr,
+        is_start: cutlass.Constexpr,
+        scope_id: cutlass.Constexpr,
         clock_idx: cutlass.Int32,
+        seg_addr,
         is_leader_thread,
         #seg_idx: cutlass.Int32,
         segment_size: cutlass.Int32,
@@ -77,12 +81,19 @@ def clock_record(
     #seg_idx = cutlass.Int32(seg_idx)
     segment_size = cutlass.Int32(segment_size)
 
+    if const_expr(is_start):
+        scope_id = cutlass.int32((scope_id & 0xff) << 23)
+    else:
+        scope_id = cutlass.int32(((scope_id & 0xff) << 23) | (1 << 31))
+
     ## Extract the raw !llvm.ptr<3> ir.Value
     ## (attribute name is `.ir_value` in CUTLASS 4.x)
     #smem_base_llvm = clock_ptr.llvm_ptr          # !llvm.ptr<3>
     ## Cast smem pointer → i32  (PTX shared-memory addresses are 32-bit)
     i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
+
+    mask = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 0x7ff)).result
 
     #wthreads = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 32)).result
     #zero = llvm.ConstantOp(i32, ir.IntegerAttr.get(i32, 0)).result
@@ -125,9 +136,11 @@ def clock_record(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+    clock_hi = llvm.AndOp(clock_hi, mask).result
+    clock_hi = llvm.OrOp(clock_hi, scope_id).result
 
     tidx, _, _ = cute.arch.thread_idx()
-    cute.printf("cur {}: {} {}", tidx, clock_lo, clock_hi)
+    cute.printf("cur {}: {} %p", tidx, clock_lo, clock_hi)
     ##p = cutlass.Boolean((tidx % 32) == 0)
     ##p = cutlass.Boolean(True)
     #tidx_in_warp = llvm.URemOp(tidx, wthreads).result
@@ -293,7 +306,7 @@ def clock_kernel(out: cute.Tensor):
     seg_addr, out_addr, is_leader_thread = init_clock(clock_ptr, out_ptr, warp_idx, 8)
 
     #clock_record(clock_ptr, 0, warp_idx, 8)
-    clock_record(seg_addr, 0, is_leader_thread, 8)
+    clock_record(True, 15, 0, seg_addr, is_leader_thread, 8)
 
     ## Extract the raw !llvm.ptr<3> ir.Value
     ## (attribute name is `.ir_value` in CUTLASS 4.x)
